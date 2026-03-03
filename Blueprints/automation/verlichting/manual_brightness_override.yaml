@@ -2,8 +2,9 @@ blueprint:
   name: Manual brightness override (met motion reset)
   author: Emiel Boonstra (https://github.com/Emielboonstra)
   description: >
-    Zet een override aan als een gebruiker de helderheid van een lamp (brightness attribuut) handmatig wijzigt.
-    Slaat de huidige lampstatus op als scene. Na 'geen motion' gedurende ingestelde tijd wordt override uitgezet en wordt de lampstatus teruggezet naar normaal.
+    Zet een override aan als een gebruiker de helderheid van een lamp (brightness attribuut) handmatig wijzigt. 
+    Slaat de huidige lampstatus op als scene. Na 'geen motion' gedurende ingestelde tijd wordt override uitgezet 
+    en wordt de lampstatus teruggezet naar normaal.
   source_url: https://github.com/Emielboonstra/BoonstraHomeassistantBlueprints/blob/main/Blueprints/automation/verlichting/manual_brightness_override.yaml
   domain: automation
 
@@ -45,7 +46,7 @@ blueprint:
 
     no_motion_time:
       name: ⏱️ Reset na geen motion
-      description: Als de bewegingssensor zo lang geen beweging heeft gezien, gaat override uit.
+      description: Als er zo lang geen "stabiele presence" is geweest, gaat override uit.
       default: "01:00:00"
       selector:
         duration: {}
@@ -63,16 +64,13 @@ blueprint:
           mode: slider
 
 
-
 mode: parallel
 max: 10
 
 variables:
-  # Een vaste (unieke) scene_id per automation instance
   manual_scene_id: "manual_override_{{ this.entity_id | slugify }}"
   motion_entities: !input motion_sensors
   override_entity: !input override_boolean
-  light_target: !input lights
 
 trigger:
   # 1) Iemand (user) verandert brightness van een lamp -> override aan + scene snapshot
@@ -85,15 +83,14 @@ trigger:
     id: presence_stable
     value_template: >
       {{ (expand(motion_entities) | selectattr('state','eq','on') | list | count) > 0 }}
-    for: 
-        seconds: !input min_motion_on
+    for:
+      seconds: !input min_motion_on
 
-  # 3) Geen motion: alle motion sensoren zijn OFF en blijven dat no_motion_time lang
-  - platform: template
-    id: no_motion_long
-    value_template: >
-      {{ (expand(motion_entities) | selectattr('state','eq','on') | list | count) == 0 }}
-    for: !input no_motion_time
+  # 3) Override werd aangezet (door deze automation of handmatig)
+  - platform: state
+    entity_id: !input override_boolean
+    to: "on"
+    id: override_enabled
 
 condition: []
 
@@ -115,35 +112,64 @@ action:
           # alleen als het door een USER komt (niet door automation/script)
           - condition: template
             value_template: >
-              {{ trigger.to_state.context.user_id is not none }}
+              {{ trigger.to_state.context.user_id is not none and trigger.to_state.context.parent_id is none }}
         sequence:
           - delay:
               seconds: !input scene_save_delay
 
-          # Zet override aan
           - service: input_boolean.turn_on
             target:
               entity_id: !input override_boolean
 
-          # Snapshot huidige lampstatus als scene
           - service: scene.create
             data:
               scene_id: "{{ manual_scene_id }}"
               snapshot_entities: !input lights
 
-
-
-
-      # ===== No motion handling (reset override) =====
+      # ===== Presence handling: als override aan, (optioneel) manual scene terugzetten =====
+      # (Je kunt dit stuk uitbreiden als je wilt dat bij motion altijd manual scene wordt toegepast)
       - conditions:
           - condition: trigger
-            id: no_motion_long
+            id: presence_stable
           - condition: state
             entity_id: !input override_boolean
             state: "on"
         sequence:
-          - service: input_boolean.turn_off
-            target:
-              entity_id: !input override_boolean
+          # Optioneel: als je wil dat bij presence de manual scene steeds terugkomt:
+          # - service: scene.turn_on
+          #   data:
+          #     entity_id: "{{ 'scene.' ~ manual_scene_id }}"
+          - delay: "00:00:00"
 
+      # ===== Override timer-loop: reset alleen door presence_stable =====
+      - conditions:
+          - condition: trigger
+            id: override_enabled
+        sequence:
+          - repeat:
+              while:
+                - condition: state
+                  entity_id: !input override_boolean
+                  state: "on"
+              sequence:
+                # Wacht op "presence_stable" (reset) OF timeout (geen stabiele presence)
+                - wait_for_trigger:
+                    - platform: template
+                      value_template: >
+                        {{ (expand(motion_entities) | selectattr('state','eq','on') | list | count) > 0 }}
+                      for:
+                        seconds: !input min_motion_on
+                  timeout: !input no_motion_time
+                  continue_on_timeout: true
+
+                # Timeout => override uit + terug-actie
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ wait.trigger is none }}"
+                      sequence:
+                        - service: input_boolean.turn_off
+                          target:
+                            entity_id: !input override_boolean
+                        - stop: "Override cleared after no stable presence"
     default: []
